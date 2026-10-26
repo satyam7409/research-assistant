@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from collections.abc import Callable
@@ -159,22 +160,86 @@ def _fake(topic: str, cb: EventCallback) -> PipelineResult:
     return result
 
 
-def _run_task(crew: Crew, cb: EventCallback, agent: str, inputs: dict, index: int):
-    for attempt in range(2):
-        _emit(cb, "agent_started", {"agent": agent})
-        result = crew.kickoff(inputs=inputs)
-        value = result.tasks_output[index].pydantic
-        if value is not None:
-            _emit(cb, "agent_finished", {"agent": agent})
-            return value
-        _emit(
-            cb,
-            "warning",
-            {"message": f"{agent} returned invalid structured output; retrying"},
+MAX_REVISIONS = 2
+
+
+def _json(items) -> str:
+    """CrewAI inputs must be plain strings/numbers/dicts, so pass objects as JSON text."""
+    return json.dumps([i.model_dump() for i in items], ensure_ascii=False)
+
+
+def _report_bad_ids(report: Report, evidence: list[Evidence]) -> set[str]:
+    valid = {e.id for e in evidence}
+    cited = {x for s in report.sections for c in s.claims for x in c.evidence_ids}
+    return cited - valid
+
+
+def _run_task(
+    cb: EventCallback,
+    name: str,
+    agent: Agent,
+    description: str,
+    expected_output: str,
+    output_model: type,
+    inputs: dict[str, str],
+):
+    """Run one task in its own single-task crew; retry once if output is invalid."""
+    for _ in range(2):
+        _emit(cb, "agent_started", {"agent": name})
+        task = Task(
+            description=description,
+            expected_output=expected_output,
+            agent=agent,
+            output_pydantic=output_model,
         )
-    raise PipelineError(
-        f"{agent} did not return valid structured output after 2 attempts"
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential)
+        result = crew.kickoff(inputs=inputs)
+        value = result.tasks_output[0].pydantic
+        if value is not None:
+            _emit(cb, "agent_finished", {"agent": name})
+            return value
+        _emit(cb, "warning", {"message": f"{name} returned invalid output; retrying"})
+    raise PipelineError(f"{name} did not return valid output after 2 attempts")
+
+
+def _review(
+    cb: EventCallback,
+    reviewer: Agent,
+    report: Report,
+    evidence: list[Evidence],
+    round_no: int,
+) -> ReviewResult:
+    _emit(cb, "review_started", {"round": round_no})
+    review = _run_task(
+        cb,
+        "reviewer",
+        reviewer,
+        description=(
+            "Fact-check every claim in the REPORT using ONLY the EVIDENCE excerpts below. "
+            "Never use outside knowledge. For each claim return a verdict: "
+            "'supported' if the cited excerpts directly support it, 'partial' if the "
+            "excerpts support only part of it or the claim overstates its source "
+            "(for example absolute words like 'infinitely' or 'always' backed by one "
+            "blog post), 'unsupported' if no excerpt supports it. Add a short note.\n\n"
+            "EVIDENCE:\n{evidence_json}\n\nREPORT:\n{report_json}"
+        ),
+        expected_output="ReviewResult JSON with one verdict per claim",
+        output_model=ReviewResult,
+        inputs={
+            "evidence_json": _json(evidence),
+            "report_json": report.model_dump_json(),
+        },
     )
+    problems = [v for v in review.claim_verdicts if v.status != "supported"]
+    review.verdict = "revise" if problems else "approve"
+    if not review.claim_verdicts:
+        _emit(cb, "warning", {"message": "Reviewer returned no claim verdicts"})
+    counts = {
+        status: sum(v.status == status for v in review.claim_verdicts)
+        for status in ("supported", "partial", "unsupported")
+    }
+    _emit(cb, "review_finished", {"verdict": review.verdict, **counts})
+    return review
 
 
 def run_pipeline(
@@ -192,70 +257,130 @@ def run_pipeline(
     writer_llm = LLM(model=settings.writer_llm_model, temperature=0.3)
     researcher = Agent(
         role="Senior Researcher",
-        goal="Collect sourced evidence about {topic}",
-        backstory="Preserve excerpts.",
+        goal="Collect accurate, sourced evidence about {topic}",
+        backstory="You only report what sources actually say. You never invent URLs.",
         tools=[web_search],
         llm=research_llm,
     )
     analyst = Agent(
         role="Research Analyst",
-        goal="Find supported insights",
-        backstory="Cite supplied ids.",
+        goal="Find insights that are strictly supported by the evidence",
+        backstory="You cite only evidence ids that exist.",
         llm=research_llm,
     )
     writer = Agent(
         role="Technical Writer",
-        goal="Write a structured cited report",
-        backstory="Never invent ids.",
+        goal="Write a structured, cited report",
+        backstory="You never invent evidence ids and never overstate a source.",
         llm=writer_llm,
     )
-    research = Task(
-        description="Use web_search and return 8-10 evidence items with URL, title and excerpt.",
+    reviewer = Agent(
+        role="Fact Checker",
+        goal="Check whether each claim is supported by the provided evidence",
+        backstory="You are strict, and you judge only against the excerpts you are given.",
+        llm=writer_llm,
+    )
+
+    raw = _run_task(
+        on_event,
+        "researcher",
+        researcher,
+        description=(
+            "Research {topic} using the web_search tool. Run 2-4 different searches. "
+            "Return 8-10 evidence items. Each needs the real URL, the title and an "
+            "excerpt copied from the search results. Never invent URLs."
+        ),
         expected_output="EvidenceList JSON",
-        agent=researcher,
-        output_pydantic=EvidenceList,
-    )
-    analysis = Task(
-        description="Analyze the evidence and return 3-5 insights with evidence ids.",
+        output_model=EvidenceList,
+        inputs={"topic": topic},
+    ).items
+    evidence = normalize_evidence(raw)
+    if len(evidence) < 3:
+        raise PipelineError("Not enough usable sources found. Try another topic.")
+    evidence_json = _json(evidence)
+    insights = _run_task(
+        on_event,
+        "analyst",
+        analyst,
+        description=(
+            "Analyze the evidence about {topic}. Return 3-5 insights. Each insight "
+            "must cite ONLY evidence ids that appear below.\n\nEVIDENCE:\n{evidence_json}"
+        ),
         expected_output="InsightList JSON",
-        agent=analyst,
-        context=[research],
-        output_pydantic=InsightList,
-    )
-    crew = Crew(
-        agents=[researcher, analyst],
-        tasks=[research, analysis],
-        process=Process.sequential,
-    )
-    evidence = normalize_evidence(
-        _run_task(crew, on_event, "researcher", {"topic": topic}, 0).items
-    )
-    analysis_out = _run_task(
-        crew, on_event, "analyst", {"topic": topic, "evidence": evidence}, 1
-    )
-    report_task = Task(
-        description="Create Report JSON with title, sections and claims using only {evidence}.",
-        expected_output="Report JSON",
-        agent=writer,
-        output_pydantic=Report,
-    )
+        output_model=InsightList,
+        inputs={"topic": topic, "evidence_json": evidence_json},
+    ).insights
     report = _run_task(
-        Crew(agents=[writer], tasks=[report_task], process=Process.sequential),
         on_event,
         "writer",
-        {"topic": topic, "evidence": evidence, "insights": analysis_out.insights},
-        0,
+        writer,
+        description=(
+            "Write a report on {topic} as structured JSON: a title and sections, each "
+            "with claims. Each claim has text and the evidence ids that support it. "
+            "Use ONLY facts from the evidence, never overstate a source, and cite only "
+            "ids that exist.\n\nEVIDENCE:\n{evidence_json}\n\nINSIGHTS:\n{insights_json}"
+        ),
+        expected_output="Report JSON",
+        output_model=Report,
+        inputs={
+            "topic": topic,
+            "evidence_json": evidence_json,
+            "insights_json": _json(insights),
+        },
     )
-    review = ReviewResult(verdict="approve", claim_verdicts=[])
+    review: ReviewResult | None = None
+    rounds = 0
+    while True:
+        bad_ids = _report_bad_ids(report, evidence)
+        if bad_ids:
+            _emit(
+                on_event, "warning", {"message": f"Nonexistent ids: {sorted(bad_ids)}"}
+            )
+            problems: list[dict] = [
+                {"issue": f"Cites nonexistent evidence ids {sorted(bad_ids)}"}
+            ]
+        else:
+            review = _review(on_event, reviewer, report, evidence, rounds + 1)
+            problems = [
+                v.model_dump() for v in review.claim_verdicts if v.status != "supported"
+            ]
+            if not problems:
+                break
+        if rounds >= MAX_REVISIONS:
+            break
+        rounds += 1
+        _emit(on_event, "revision_started", {"round": rounds})
+        report = _run_task(
+            on_event,
+            "writer",
+            writer,
+            description=(
+                "Revise the report on {topic}. Fix or remove ONLY the problem claims "
+                "listed below, and keep every supported claim unchanged. Use only "
+                "evidence ids that exist.\n\nPROBLEMS:\n{problems_json}\n\n"
+                "EVIDENCE:\n{evidence_json}\n\nCURRENT REPORT:\n{report_json}"
+            ),
+            expected_output="Report JSON",
+            output_model=Report,
+            inputs={
+                "topic": topic,
+                "problems_json": json.dumps(problems, ensure_ascii=False),
+                "evidence_json": evidence_json,
+                "report_json": report.model_dump_json(),
+            },
+        )
+    if review is None:
+        review = ReviewResult(verdict="revise", claim_verdicts=[])
     result = PipelineResult(
         topic=topic,
         report=report,
         markdown=render_markdown(report),
         evidence=evidence,
-        insights=analysis_out.insights,
+        insights=insights,
         review=review,
-        revision_rounds=0,
+        revision_rounds=rounds,
     )
+    result.bad_citations = sorted(find_bad_citations(result))
     _emit(on_event, "pipeline_finished", {"evidence_count": len(evidence)})
     return result
 
